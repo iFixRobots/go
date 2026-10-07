@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -227,11 +228,50 @@ var (
 	EventHandlingResultIgnored = EventHandlingResult{Success: true, Ignored: true}
 )
 
+const (
+	remoteEventPending uint32 = iota
+	remoteEventRunning
+	remoteEventFinished
+)
+
+type remoteEventCompletion struct {
+	state atomic.Uint32
+	done  chan EventHandlingResult
+	stop  func() bool
+}
+
+func (completion *remoteEventCompletion) finish(from uint32, result EventHandlingResult) {
+	if completion.state.CompareAndSwap(from, remoteEventFinished) {
+		completion.done <- result
+		close(completion.done)
+	}
+}
+
+func (ul *UserLogin) QueueRemoteEventWithCompletion(evt RemoteEvent) (EventHandlingResult, <-chan EventHandlingResult) {
+	return ul.Bridge.QueueRemoteEventWithCompletion(ul, evt)
+}
+
+func (br *Bridge) QueueRemoteEventWithCompletion(login *UserLogin, evt RemoteEvent) (EventHandlingResult, <-chan EventHandlingResult) {
+	completion := &remoteEventCompletion{done: make(chan EventHandlingResult, 1)}
+	result := br.queueRemoteEvent(login, evt, completion)
+	if !result.Queued {
+		if completion.stop != nil {
+			completion.stop()
+		}
+		completion.finish(remoteEventPending, result)
+	}
+	return result, completion.done
+}
+
 func (ul *UserLogin) QueueRemoteEvent(evt RemoteEvent) EventHandlingResult {
 	return ul.Bridge.QueueRemoteEvent(ul, evt)
 }
 
 func (br *Bridge) QueueRemoteEvent(login *UserLogin, evt RemoteEvent) EventHandlingResult {
+	return br.queueRemoteEvent(login, evt, nil)
+}
+
+func (br *Bridge) queueRemoteEvent(login *UserLogin, evt RemoteEvent, completion *remoteEventCompletion) EventHandlingResult {
 	log := login.Log
 	ctx := log.WithContext(br.BackgroundCtx)
 	maybeUncertain, ok := evt.(RemoteEventWithUncertainPortalReceiver)
@@ -268,8 +308,14 @@ func (br *Bridge) QueueRemoteEvent(login *UserLogin, evt RemoteEvent) EventHandl
 	}
 	// TODO put this in a better place, and maybe cache to avoid constant db queries
 	login.MarkInPortal(ctx, portal)
+	if completion != nil {
+		completion.stop = context.AfterFunc(portal.backgroundCtx, func() {
+			completion.finish(remoteEventPending, portal.eventQueueCanceledResult())
+		})
+	}
 	return portal.queueEvent(ctx, &portalRemoteEvent{
-		evt:    evt,
-		source: login,
+		evt:        evt,
+		source:     login,
+		completion: completion,
 	})
 }

@@ -44,9 +44,11 @@ type portalMatrixEvent struct {
 }
 
 type portalRemoteEvent struct {
-	evt     RemoteEvent
-	source  *UserLogin
-	evtType RemoteEventType
+	evt        RemoteEvent
+	source     *UserLogin
+	evtType    RemoteEventType
+	eventIdx   int
+	completion *remoteEventCompletion
 }
 
 type portalCreateEvent struct {
@@ -353,10 +355,7 @@ func (br *Bridge) GetExistingPortalByKey(ctx context.Context, key networkid.Port
 
 func (portal *Portal) queueEvent(ctx context.Context, evt portalEvent) EventHandlingResult {
 	if portal.backgroundCtx.Err() != nil {
-		if portal.Bridge.BackgroundCtx.Err() != nil {
-			return EventHandlingResultFailed.WithError(fmt.Errorf("bridge shutting down: %w", portal.Bridge.BackgroundCtx.Err()))
-		}
-		return EventHandlingResultIgnored
+		return portal.eventQueueCanceledResult()
 	}
 	if portal.Bridge.Config.PortalEventBuffer == 0 {
 		portal.eventsLock.Lock()
@@ -390,6 +389,13 @@ func (portal *Portal) queueEvent(ctx context.Context, evt portalEvent) EventHand
 			}
 		}
 	}
+}
+
+func (portal *Portal) eventQueueCanceledResult() EventHandlingResult {
+	if err := portal.Bridge.BackgroundCtx.Err(); err != nil {
+		return EventHandlingResultFailed.WithError(fmt.Errorf("bridge shutting down: %w", err))
+	}
+	return EventHandlingResultIgnored
 }
 
 func (portal *Portal) eventLoop() {
@@ -427,15 +433,28 @@ func blockBubblingEventError(err error) bool {
 }
 
 func (portal *Portal) handleSingleEventWithDelayLogging(idx int, rawEvt any) (outerRes EventHandlingResult) {
-	ctx := portal.getEventCtxWithLog(rawEvt, idx)
+	var ctx context.Context
+	var completion *remoteEventCompletion
+	if evt, ok := rawEvt.(*portalRemoteEvent); ok && evt.completion != nil {
+		completion = evt.completion
+		evt.eventIdx = idx
+		ctx = portal.Log.With().Int("event_loop_index", idx).
+			Str("action", "handle remote event").
+			Str("source_id", string(evt.source.ID)).Logger().WithContext(portal.backgroundCtx)
+	} else {
+		ctx = portal.getEventCtxWithLog(rawEvt, idx)
+	}
 	log := zerolog.Ctx(ctx)
-	doneCh := make(chan struct{})
+	doneCh := make(chan EventHandlingResult, 1)
 	var backgrounded atomic.Bool
 	start := time.Now()
 	var handleDuration time.Duration
 	// Note: this will assume success if the handler times out
 	outerRes = EventHandlingResult{Queued: true, Success: true, Error: ErrHandlerBackgrounded}
 	go portal.handleSingleEvent(ctx, rawEvt, func(res EventHandlingResult) {
+		if completion != nil {
+			completion.finish(remoteEventRunning, res)
+		}
 		// If the portal was deleted, ignore errors.
 		// The bridge background ctx check distinguishes bridge stops from portal deletions.
 		if res.Error != nil && portal.backgroundCtx.Err() != nil && portal.Bridge.BackgroundCtx.Err() == nil {
@@ -448,9 +467,8 @@ func (portal *Portal) handleSingleEventWithDelayLogging(idx int, rawEvt any) (ou
 			log.Debug().Err(res.Error).Msg("Not bubbling up Matrix error from event handler")
 			res = EventHandlingResultIgnored
 		}
-		outerRes = res
 		handleDuration = time.Since(start)
-		close(doneCh)
+		doneCh <- res
 		if backgrounded.Load() {
 			log.Debug().
 				Time("started_at", start).
@@ -463,7 +481,7 @@ func (portal *Portal) handleSingleEventWithDelayLogging(idx int, rawEvt any) (ou
 	defer tick.Stop()
 	for i := 0; i < EventHandlingTimeoutTicks || isCreate; i++ {
 		select {
-		case <-doneCh:
+		case outerRes = <-doneCh:
 			if i > 0 {
 				log.Debug().
 					Time("started_at", start).
@@ -570,7 +588,12 @@ func (portal *Portal) handleSingleEvent(ctx context.Context, rawEvt any, doneCal
 	var res EventHandlingResult
 	defer func() {
 		doneCallback(res)
+	}()
+	defer func() {
 		if v := recover(); v != nil {
+			if evt, ok := rawEvt.(*portalRemoteEvent); ok && evt.completion != nil {
+				res = EventHandlingResultFailed.WithError(ErrPanicInEventHandler)
+			}
 			err := exerrors.RecoverToError(v)
 			stack := debug.Stack()
 			log.Err(err).
@@ -591,6 +614,18 @@ func (portal *Portal) handleSingleEvent(ctx context.Context, rawEvt any, doneCal
 			})
 		}
 	}()
+	if evt, ok := rawEvt.(*portalRemoteEvent); ok && evt.completion != nil {
+		if portal.backgroundCtx.Err() != nil {
+			evt.completion.finish(remoteEventPending, portal.eventQueueCanceledResult())
+		}
+		if !evt.completion.state.CompareAndSwap(remoteEventPending, remoteEventRunning) {
+			res = portal.eventQueueCanceledResult()
+			return
+		}
+		evt.completion.stop()
+		ctx = portal.getEventCtxWithLog(rawEvt, evt.eventIdx)
+		log = zerolog.Ctx(ctx)
+	}
 	switch evt := rawEvt.(type) {
 	case *portalMatrixEvent:
 		isStateRequest := evt.evt.Type == event.BeeperSendState
@@ -5777,10 +5812,6 @@ func (portal *Portal) unlockedDeleteCache() {
 		delete(portal.Bridge.portalsByMXID, portal.MXID)
 	}
 	portal.cancelBackground()
-	if portal.events != nil {
-		// TODO there's a small risk of this racing with a queueEvent call
-		close(portal.events)
-	}
 }
 
 func (portal *Portal) Save(ctx context.Context) error {
